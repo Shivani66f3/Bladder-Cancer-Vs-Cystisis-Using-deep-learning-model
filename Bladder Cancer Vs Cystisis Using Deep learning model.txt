@@ -1,0 +1,258 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import RFE
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import NearestNeighbors
+from imblearn.over_sampling import SMOTE, RandomOverSampler
+from sklearn.metrics import roc_curve, auc, confusion_matrix, classification_report
+import matplotlib.pyplot as plt
+import seaborn as sns
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+from tensorflow.keras import layers, Model, Input
+
+# ---------------------------
+# User config / paths
+# ---------------------------
+CSV_PATH = "clinical_dataset.csv"   # your combined CSV
+train_cancer_path = r"C:\Users\91910\Documents\archive_1\bladder cancer train\train\Above T1"
+train_normal_path = r"C:\Users\91910\Documents\archive_1\bladder cancer train\train\Normal"
+test_cancer_path  = r"C:\Users\91910\Documents\archive_1\bladder cancer test\Test\Above T1"
+test_normal_path  = r"C:\Users\91910\Documents\archive_1\bladder cancer test\Test\Normal"
+
+IMG_SIZE = (224, 224)   # EfficientNetB0 default-ish size
+
+# ---------------------------
+# Helper: image loading (with existence check)
+# ---------------------------
+def preprocess_image(path):
+    try:
+        img = load_img(path, target_size=IMG_SIZE)
+        img = img_to_array(img)
+        return img
+    except Exception as e:
+        return None
+
+def load_data_from_df(sub_df):
+    X_img, X_tab, y, files = [], [], [], []
+    missing = 0
+    for _, row in sub_df.iterrows():
+        if row["split"] == "train":
+            folder = train_cancer_path if row["label"] == 1 else train_normal_path
+        else:
+            folder = test_cancer_path if row["label"] == 1 else test_normal_path
+
+        path = os.path.join(folder, row["image_file"])
+        img = preprocess_image(path)
+        if img is None:
+            missing += 1
+            # skip rows whose image file isn't found/readable
+            continue
+
+        # clinical features: [age, sex(M=1 else 0), hematuria]
+        sex_val = 1 if str(row["sex"]).strip().upper() == "M" else 0
+        X_img.append(img)
+        X_tab.append([row["age"], sex_val, row["hematuria"], row["tumor"], row["urgency"], row["pelvic_pain"], row["abdominal_pain"]])
+        y.append(int(row["label"]))
+        files.append(path)
+
+    if missing > 0:
+        print(f"Note: skipped {missing} rows because images were missing/unreadable.")
+
+    return np.array(X_img, dtype="float32"), np.array(X_tab, dtype="float32"), np.array(y, dtype="int32"), files
+
+# ---------------------------
+# Load combined CSV and split
+# ---------------------------
+df = pd.read_csv(CSV_PATH)
+
+np.random.seed(42)  # for reproducibility
+df["tumor"] = np.random.randint(0, 5, size=len(df))          # e.g., tumor size category (0–4)
+df["urgency"] = np.random.randint(0, 2, size=len(df))        # binary 0/1
+df["pelvic_pain"] = np.random.randint(0, 2, size=len(df))    # binary 0/1
+df["abdominal_pain"] = np.random.randint(0, 2, size=len(df)) 
+
+train_df = df[df["split"] == "train"].reset_index(drop=True)
+test_df  = df[df["split"] == "test"].reset_index(drop=True)
+
+# Load data (only rows whose images exist will be loaded)
+X_img_train, X_tab_train, y_train, train_files = load_data_from_df(train_df)
+X_img_test,  X_tab_test,  y_test,  test_files  = load_data_from_df(test_df)
+
+print("Loaded shapes (before preprocessing):")
+print("  X_img_train:", X_img_train.shape)
+print("  X_tab_train:", X_tab_train.shape)
+print("  y_train:", y_train.shape)
+print("  X_img_test:", X_img_test.shape)
+print("  X_tab_test:", X_tab_test.shape)
+print("  y_test:", y_test.shape)
+
+# ---------------------------
+# Tabular preprocessing: impute -> scale
+# ---------------------------
+imputer = SimpleImputer(strategy="median")
+X_tab_train = imputer.fit_transform(X_tab_train)
+X_tab_test  = imputer.transform(X_tab_test)
+
+scaler = StandardScaler()
+X_tab_train = scaler.fit_transform(X_tab_train)
+X_tab_test  = scaler.transform(X_tab_test)
+
+# ---------------------------
+# Feature selection (RFE)
+# ---------------------------
+# ensure n_features_to_select < original features
+n_features_to_select = min(2, X_tab_train.shape[1])
+rfe_est = LogisticRegression(max_iter=1000, solver="lbfgs")
+rfe = RFE(rfe_est, n_features_to_select=n_features_to_select)
+X_tab_train_sel = rfe.fit_transform(X_tab_train, y_train)
+X_tab_test_sel  = rfe.transform(X_tab_test)
+
+# ---------------------------
+# Dimensionality reduction (PCA)
+# ---------------------------
+pca_components = min(2, X_tab_train_sel.shape[1])
+pca = PCA(n_components=pca_components)
+X_tab_train_pca = pca.fit_transform(X_tab_train_sel)
+X_tab_test_pca  = pca.transform(X_tab_test_sel)
+
+print("Tabular after RFE+PCA shapes:", X_tab_train_pca.shape, X_tab_test_pca.shape)
+
+# ---------------------------
+# Oversampling: SMOTE (with fallback)
+# We will generate synthetic tabular features, then map each synthetic row
+# to the nearest real training row and copy that row's image so image/tabular stay aligned.
+# ---------------------------
+from collections import Counter
+counter = Counter(y_train)
+print("Class counts before oversampling:", counter)
+
+minority_count = min(counter.values())
+
+if minority_count < 2:
+    # SMOTE will fail; fallback to RandomOverSampler (duplicates real samples)
+    print("Too few minority samples for SMOTE; using RandomOverSampler fallback.")
+    ros = RandomOverSampler(random_state=42)
+    X_tab_res, y_res = ros.fit_resample(X_tab_train_pca, y_train)
+else:
+    k_neighbors = min(5, minority_count - 1)
+    smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
+    X_tab_res, y_res = smote.fit_resample(X_tab_train_pca, y_train)
+
+print("Class counts after oversampling:", Counter(y_res))
+print("Shapes after tabular oversampling:", X_tab_res.shape, y_res.shape)
+
+# ---------------------------
+# Map resampled tabular rows to images:
+# For each row in X_tab_res find nearest neighbor in original training tabular X_tab_train_pca
+# and pick that neighbor's image. This creates X_img_resaligned aligned with X_tab_res.
+# ---------------------------
+nn = NearestNeighbors(n_neighbors=1)
+nn.fit(X_tab_train_pca)  # original training tabular (before oversampling)
+_, idxs = nn.kneighbors(X_tab_res, return_distance=True)
+idxs = idxs.flatten().astype(int)  # indices into original training arrays
+
+X_img_res = X_img_train[idxs]      # pick corresponding images
+# Now final training arrays:
+X_tab_final = X_tab_res
+X_img_final = X_img_res
+y_final     = y_res
+
+print("Final training shapes (aligned):", X_tab_final.shape, X_img_final.shape, y_final.shape)
+
+# ---------------------------
+# Prepare test arrays (already loaded). Convert images to expected input for EfficientNet
+# ---------------------------
+# EfficientNet has its own preprocessing; use it
+from tensorflow.keras.applications.efficientnet import preprocess_input as eff_preprocess
+
+X_img_final = eff_preprocess(X_img_final.copy())
+X_img_test  = eff_preprocess(X_img_test.copy())
+
+# ---------------------------
+# Build multimodal model (EfficientNetB0 image branch + small MLP for clinical)
+# ---------------------------
+clinical_in = Input(shape=(X_tab_final.shape[1],), name="clinical_input")
+c = layers.Dense(32, activation="relu")(clinical_in)
+c = layers.BatchNormalization()(c)
+c = layers.Dense(16, activation="relu")(c)
+
+image_in = Input(shape=(*IMG_SIZE, 3), name="image_input")
+base = tf.keras.applications.EfficientNetB0(weights="imagenet", include_top=False, pooling="avg")
+base.trainable = False
+v = base(image_in)
+v = layers.Dense(64, activation="relu")(v)
+
+combined = layers.Concatenate()([c, v])
+x = layers.Dense(64, activation="relu")(combined)
+x = layers.Dropout(0.3)(x)
+out = layers.Dense(1, activation="sigmoid")(x)
+
+model = Model(inputs=[clinical_in, image_in], outputs=out)
+model.compile(optimizer="adam", loss="binary_crossentropy",
+              metrics=["accuracy", tf.keras.metrics.AUC(name="auc")])
+
+model.summary()
+
+# ---------------------------
+# Train (with early stopping + best model checkpoint)
+# ---------------------------
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+
+es = EarlyStopping(monitor="val_auc", mode="max", patience=6, restore_best_weights=True, verbose=1)
+ckpt = ModelCheckpoint("bladder_cancer_model.keras", monitor="val_auc", mode="max", save_best_only=True, verbose=1)
+
+history = model.fit(
+    {"clinical_input": X_tab_final, "image_input": X_img_final},
+    y_final,
+    epochs=50,
+    batch_size=16,
+    validation_split=0.2,
+    callbacks=[es, ckpt]
+)
+
+# ---------------------------
+# Evaluate on test set
+# ---------------------------
+# Ensure test tabular features are transformed by the same pipeline (we already applied imputer/scaler/rfe/pca)
+X_tab_test_used = X_tab_test_pca  # already transformed above
+print("Test shapes used for evaluation:", X_tab_test_used.shape, X_img_test.shape, y_test.shape)
+
+loss, acc, auc_val = model.evaluate({"clinical_input": X_tab_test_used, "image_input": X_img_test}, y_test, verbose=0)
+print(f"Test Accuracy: {acc:.4f}, Test AUC: {auc_val:.4f}")
+
+# ---------------------------
+# Predictions & Metrics: ROC, Confusion Matrix, Classification Report
+# ---------------------------
+y_pred_prob = model.predict({"clinical_input": X_tab_test_used, "image_input": X_img_test}).ravel()
+y_pred = (y_pred_prob >= 0.5).astype(int)
+
+# ROC
+fpr, tpr, _ = roc_curve(y_test, y_pred_prob)
+roc_auc = auc(fpr, tpr)
+plt.figure(figsize=(6,6))
+plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.3f}")
+plt.plot([0,1],[0,1], linestyle="--", color="gray")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve")
+plt.legend(loc="lower right")
+plt.show()
+
+# Confusion Matrix
+cm = confusion_matrix(y_test, y_pred)
+plt.figure(figsize=(5,4))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+            xticklabels=["Normal","Cancer"], yticklabels=["Normal","Cancer"])
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.title("Confusion Matrix")
+plt.show()
+
+# Classification Report
+print("Classification Report:")
+print(classification_report(y_test, y_pred, target_names=["Normal","Cancer"]))
